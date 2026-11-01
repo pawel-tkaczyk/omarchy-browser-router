@@ -36,6 +36,48 @@ class Matching(unittest.TestCase):
         self.assertFalse(r.matches("localhost:3000", "http://localhost:4000"))
         self.assertTrue(r.matches("żółw.pl", "https://xn--w-uga1v8h.pl/"))
 
+    def test_distinct_international_domains_do_not_share_rules(self):
+        self.assertTrue(r.matches("faß.de", "https://xn--fa-hia.de/"))
+        self.assertFalse(r.matches("faß.de", "https://fass.de/"))
+        self.assertFalse(r.matches("fass.de", "https://faß.de/"))
+        self.assertTrue(r.matches("ς.gr", "https://xn--3xa.gr/"))
+        self.assertFalse(r.matches("ς.gr", "https://σ.gr/"))
+
+    def test_unicode_case_and_encoded_hostnames(self):
+        self.assertTrue(r.matches("bücher.example", "https://BÜCHER.example/"))
+        self.assertTrue(r.matches("example.com", "https://%65xample.com/"))
+        self.assertTrue(r.matches("example.com", "https://ＥＸＡＭＰＬＥ.com/"))
+        self.assertTrue(r.matches("internal_name.local", "http://internal_name.local/"))
+
+    def test_dot_segments_are_resolved_before_path_rules(self):
+        for segment in ("..", "%2e%2e", "%2E%2E", ".%2e", "%2e."):
+            with self.subTest(segment=segment):
+                url = "https://example.com/work/" + segment + "/personal"
+                self.assertFalse(r.matches("example.com/work", url))
+                self.assertTrue(r.matches("example.com/personal", url))
+        self.assertTrue(r.matches("example.com/work", "https://example.com/other/../work"))
+        self.assertTrue(r.matches("example.com/work", "https://example.com/./work/./project"))
+        self.assertTrue(r.matches("example.com/work/../personal", "https://example.com/personal"))
+
+    def test_normalized_paths_preserve_slashes_and_non_dot_escapes(self):
+        cases = {"": "/", "/work/..": "/", "/work/.": "/work/", "/../../work": "/work", "/a//b": "/a//b", "/a//../b": "/a/b", "/work/%2fproject": "/work/%2fproject", "/work/...": "/work/..."}
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(r.normalized_path(path), expected)
+
+    def test_browser_backslash_separators(self):
+        self.assertFalse(r.matches("example.com/work", "https://example.com/work\\..\\personal"))
+        self.assertTrue(r.matches("example.com/personal", "https://example.com/work\\..\\personal?q=\\work"))
+        self.assertEqual(r.validate_url("https://example.com/?q=\\work").query, "q=\\work")
+
+    def test_ipv6_rules_and_legacy_always_patterns(self):
+        self.assertTrue(r.matches("[::1]", "http://[::1]:3000/"))
+        self.assertTrue(r.matches("::1", "http://[::1]:3000/"))
+        self.assertTrue(r.matches("[0:0:0:0:0:0:0:1]", "http://[::1]/"))
+        self.assertFalse(r.matches("[::1]", "https://example.com/"))
+        self.assertTrue(r.matches("[::1]:3000", "http://[::1]:3000/"))
+        self.assertFalse(r.matches("[::1]:3000", "http://[::1]:4000/"))
+
     def test_reject_unsafe_urls_and_rules(self):
         for url in ["javascript:alert(1)", "file:///etc/passwd", "--incognito", "https://u:p@example.com", "https://example.com/\n", "https://example.com:bad"]:
             with self.subTest(url=url), self.assertRaises(ValueError):
@@ -116,8 +158,7 @@ class Isolated(unittest.TestCase):
         target = {**self.target(), "id": "brave.desktop"}
         with patch.object(r, "system_browser", return_value=r.DESKTOP):
             self.assertEqual(r.system_target(config, [target]), target)
-            with self.assertRaises(ValueError):
-                r.system_target({}, [target])
+            self.assertIsNone(r.system_target({}, [target]))
 
     def test_enable_and_restore_distinct_handlers(self):
         config = {"version": 1, "rules": []}
@@ -179,6 +220,53 @@ class Isolated(unittest.TestCase):
             self.assertEqual(len(r.pending()), 1)
             summon.assert_called_once()
 
+    def test_missing_system_browser_queues_link_and_asks(self):
+        r.write_json(r.CONFIG, {"version": 1, "rules": [], "fallback": "system", "previous_browser": "removed.desktop"})
+        with patch.object(r, "discover", return_value=[]), patch.object(r, "system_browser", return_value=r.DESKTOP), patch.object(r, "summon") as summon, patch.object(r, "launch") as launch:
+            decisions = r.route(["https://example.com/"], dry_run=True)
+            self.assertEqual(decisions[0]["target"], "ask")
+            self.assertEqual(r.pending(), [])
+            r.route(["https://example.com/"])
+            self.assertEqual(r.pending()[0]["url"], "https://example.com/")
+            summon.assert_called_once()
+            launch.assert_not_called()
+
+    def test_missing_system_browser_without_url_opens_settings(self):
+        r.write_json(r.CONFIG, {"version": 1, "rules": [], "fallback": "system"})
+        with patch.object(r, "discover", return_value=[]), patch.object(r, "system_browser", return_value=r.DESKTOP), patch.object(r, "summon") as summon:
+            r.route([])
+            summon.assert_called_once()
+            self.assertEqual(r.pending(), [])
+
+    def test_pending_handles_concurrent_deletion_before_stat(self):
+        r.enqueue("https://example.com/gone")
+        r.enqueue("https://example.com/remaining")
+        first = r.pending()[0]
+        path = r.request_path(first["id"])
+        original_stat = Path.stat
+
+        def removed_stat(candidate, *args, **kwargs):
+            if candidate == path:
+                raise FileNotFoundError("Another picker removed the link")
+            return original_stat(candidate, *args, **kwargs)
+
+        with patch.object(Path, "stat", removed_stat):
+            remaining = r.pending()
+        self.assertEqual([item["url"] for item in remaining], ["https://example.com/remaining"])
+
+    def test_pending_handles_concurrent_deletion_before_read(self):
+        r.enqueue("https://example.com/gone")
+        path = r.request_path(r.pending()[0]["id"])
+        original_read = r.read_json
+
+        def removed_read(candidate, *args, **kwargs):
+            if candidate == path:
+                candidate.unlink()
+            return original_read(candidate, *args, **kwargs)
+
+        with patch.object(r, "read_json", removed_read):
+            self.assertEqual(r.pending(), [])
+
     def test_always_adds_first_and_opens_only_selected_profile(self):
         r.write_json(r.CONFIG, {"version": 1, "rules": [{"id": "existing", "pattern": "example.com", "target": "ask"}], "fallback": "system"})
         r.enqueue("https://example.com/path")
@@ -188,6 +276,29 @@ class Isolated(unittest.TestCase):
             launch.assert_called_once_with(self.target(), ["https://example.com/path"], False)
         self.assertEqual(r.load_config()["rules"][0]["target"], self.target()["id"])
         self.assertEqual(r.pending(), [])
+
+    def test_always_on_ipv6_saves_valid_rule_without_breaking_other_urls(self):
+        r.write_json(r.CONFIG, {"version": 1, "rules": [], "fallback": "system"})
+        r.enqueue("http://[::1]:3000/dashboard")
+        request = r.pending()[0]
+        with patch.object(r, "discover", return_value=[self.target()]), patch.object(r, "launch"), patch.object(r, "snapshot", return_value={}):
+            r.action("choose", {"id": request["id"], "target": self.target()["id"], "remember": True})
+        config = r.load_config()
+        self.assertEqual(config["rules"][0]["pattern"], "[::1]")
+        self.assertEqual(r.resolve(config, "http://[::1]:3000/other")[0], self.target()["id"])
+        self.assertEqual(r.resolve(config, "https://example.com/")[0], "system")
+        self.assertEqual(r.pending(), [])
+
+    def test_always_rule_limit_does_not_launch_or_delete_pending_link(self):
+        r.write_json(r.CONFIG, {"version": 1, "rules": [{"id": str(i), "pattern": "example.com", "target": "ask"} for i in range(1000)], "fallback": "system"})
+        r.enqueue("https://example.com/")
+        request = r.pending()[0]
+        with patch.object(r, "discover", return_value=[self.target()]), patch.object(r, "launch") as launch:
+            with self.assertRaises(ValueError):
+                r.action("choose", {"id": request["id"], "target": self.target()["id"], "remember": True})
+            launch.assert_not_called()
+        self.assertEqual(len(r.pending()), 1)
+        self.assertEqual(len(r.load_config()["rules"]), 1000)
 
     def test_host_ui_sinks_escape_markup(self):
         qml = (FILE.parents[1] / "Settings.qml").read_text()

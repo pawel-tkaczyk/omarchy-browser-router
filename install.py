@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Install the public plugin and its XDG handler without changing browser defaults."""
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -48,6 +49,8 @@ def main():
         return
     if not shutil.which("omarchy"):
         sys.exit("Omarchy is required")
+    if importlib.util.find_spec("idna") is None:
+        sys.exit("Install the URL hostname dependency first: omarchy pkg add python-idna")
     subprocess.run(["omarchy", "plugin", "validate", str(SOURCE)], check=True)
     if SOURCE != DEST.resolve():
         if DEST.exists():

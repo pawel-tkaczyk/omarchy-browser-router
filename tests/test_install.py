@@ -15,6 +15,13 @@ spec.loader.exec_module(installer)
 
 
 class Installer(unittest.TestCase):
+    def test_missing_hostname_dependency_stops_before_install(self):
+        with patch.object(installer.shutil, "which", return_value="/mock/omarchy"), patch.object(installer.importlib.util, "find_spec", return_value=None), patch.object(installer.shutil, "copytree") as copy, patch.object(installer.subprocess, "run") as run, patch("sys.argv", ["install.py"]):
+            with self.assertRaisesRegex(SystemExit, "omarchy pkg add python-idna"):
+                installer.main()
+        copy.assert_not_called()
+        run.assert_not_called()
+
     def test_install_and_uninstall_preserve_unrelated_shell_settings(self):
         with tempfile.TemporaryDirectory(prefix="router space ") as folder:
             root = Path(folder)

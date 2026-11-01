@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local-only URL routing for Omarchy. Python standard library; never a shell."""
+"""Local-only URL routing for Omarchy. Never evaluates a shell command."""
 from __future__ import annotations
 
 import argparse
@@ -7,6 +7,7 @@ import configparser
 import contextlib
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -17,8 +18,10 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 import uuid
+
+import idna
 
 PLUGIN = "paweltkaczyk.browser-router"
 DESKTOP = "omarchy-browser-router.desktop"
@@ -242,18 +245,62 @@ def discover():
 def validate_url(url):
     if not isinstance(url, str) or not url or len(url) > MAX_URL or any(ord(c) < 32 or ord(c) == 127 for c in url):
         raise ValueError("Invalid URL")
-    parsed = urlsplit(url)
+    # Browsers treat backslashes as separators in HTTP(S) paths/authorities,
+    # but leave those inside a query or fragment alone.
+    parts = re.split(r"(?=[?#])", url, maxsplit=1)
+    parsed = urlsplit(parts[0].replace("\\", "/") + "".join(parts[1:]))
     if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname or parsed.username is not None or parsed.password is not None:
         raise ValueError("Use an http:// or https:// URL without embedded credentials")
     try:
         parsed.port
     except ValueError as error:
         raise ValueError("Invalid URL port") from error
-    return parsed
+    hostname(parsed.hostname)
+    return parsed._replace(path=normalized_path(parsed.path))
 
 
 def hostname(value):
-    return value.rstrip(".").encode("idna").decode("ascii").lower()
+    try:
+        value = unquote(value, errors="strict")
+        if ":" in value:
+            if "%" in value:
+                raise ValueError("IPv6 zone identifiers are not supported")
+            return ipaddress.IPv6Address(value).compressed
+        # Non-transitional UTS #46 keeps ß and final sigma distinct. The stdlib
+        # IDNA 2003 codec incorrectly merges them with other browser domains.
+        value = idna.uts46_remap(value, std3_rules=False, transitional=False)
+        value = value.removesuffix(".")
+        labels = []
+        for label in value.split("."):
+            # HTTP browsers also accept ASCII internal names with underscores.
+            if label.isascii() and re.fullmatch(r"[a-z0-9_-]+", label):
+                labels.append(label)
+            else:
+                labels.append(idna.encode(label).decode("ascii"))
+        return ".".join(labels)
+    except (UnicodeError, idna.IDNAError, ValueError) as error:
+        raise ValueError("Invalid URL hostname") from error
+
+
+def normalized_path(path):
+    """Resolve literal and percent-encoded dot segments as HTTP browsers do."""
+    segments = path.split("/")[1:] if path else []
+    result = []
+    for index, segment in enumerate(segments):
+        dots = re.sub(r"%2e", ".", segment, flags=re.IGNORECASE)
+        if dots in (".", ".."):
+            if dots == ".." and result:
+                result.pop()
+            if index == len(segments) - 1:
+                result.append("")
+        else:
+            result.append(segment)
+    return "/" + "/".join(result)
+
+
+def domain_pattern(url):
+    host = hostname(validate_url(url).hostname)
+    return "[" + host + "]" if ":" in host else host
 
 
 def pattern_parts(pattern):
@@ -263,6 +310,12 @@ def pattern_parts(pattern):
     wildcard = pattern.startswith("*.")
     if wildcard:
         pattern = pattern[2:]
+    # Accept a legacy bare IPv6 rule written by 0.1.1's Always action.
+    if "://" not in pattern and ":" in pattern and not pattern.startswith("["):
+        try:
+            pattern = "[" + ipaddress.IPv6Address(pattern).compressed + "]"
+        except ValueError:
+            pass
     parsed = validate_url(pattern if "://" in pattern else "https://" + pattern)
     if parsed.query or parsed.fragment or "*" in parsed.netloc or "*" in parsed.path:
         raise ValueError("Rules support domains, *.subdomains, and path prefixes; omit query strings and fragments")
@@ -309,8 +362,6 @@ def system_target(config, targets):
     if desktop in (DESKTOP, "omarchy-browser.desktop", ""):
         desktop = config.get("previous_browser", "")
     target = next((t for t in targets if t["id"] == desktop), None)
-    if not target:
-        raise ValueError("The Omarchy default browser is unavailable. Select a fallback browser/profile in Browser Router.")
     return target
 
 
@@ -353,7 +404,12 @@ def pending():
     # Links expire after a day; they are not a browsing history.
     result = []
     for path in sorted(folder.glob("*.json"), key=lambda p: p.name):
-        if time.time() - path.stat().st_mtime > 86400:
+        try:
+            modified = path.stat().st_mtime
+        except FileNotFoundError:
+            # Another picker or an expiry sweep may have handled this link.
+            continue
+        if time.time() - modified > 86400:
             path.unlink(missing_ok=True)
             continue
         value = read_json(path)
@@ -495,7 +551,10 @@ def action(name, payload):
                 if not target:
                     raise ValueError("That browser/profile is no longer available")
                 if payload.get("remember"):
-                    pattern = hostname(validate_url(request["url"]).hostname)
+                    pattern = domain_pattern(request["url"])
+                    pattern_parts(pattern)
+                    if len(config["rules"]) >= 1000:
+                        raise ValueError("At most 1000 rules are supported")
                     # User's explicit Always action wins over existing broad rules.
                     config["rules"].insert(0, {"id": uuid.uuid4().hex, "pattern": pattern, "target": target["id"], "enabled": True})
                 launch(target, [request["url"]], request.get("private", False))

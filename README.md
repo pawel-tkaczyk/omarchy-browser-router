@@ -2,10 +2,12 @@
 
 Open work links in your work profile, personal links in your personal profile,
 and shared sites in a browser picker. A native Omarchy shell plugin with a small,
-local URL handler. No Python packages, background daemon, or network service.
+local URL handler. No background daemon or network service.
 
-**Status: initial release (0.1.1).** Requires Omarchy's Quickshell plugin system
-(`omarchy plugin validate` must be available), Python 3.10+, and xdg-utils.
+**Status: initial release (0.1.2).** Requires Omarchy's Quickshell plugin system
+(`omarchy plugin validate` must be available), Python 3.10+, `python-idna`, and
+xdg-utils. `python-idna` supplies modern international-domain handling so distinct
+domains cannot be merged by Python's legacy IDNA codec.
 
 ## Features
 
@@ -26,6 +28,7 @@ local URL handler. No Python packages, background daemon, or network service.
 ## Install
 
 ```sh
+omarchy pkg add python-idna
 git clone https://github.com/pawel-tkaczyk/omarchy-browser-router.git
 cd omarchy-browser-router
 python3 install.py --enable-plugin
@@ -74,7 +77,10 @@ quoted executables in desktop entries.
 | `localhost:3000` | That host and explicit port |
 
 Domains are case insensitive and international domain names are normalized.
-Paths are case sensitive. Query strings and fragments are ignored when matching;
+IPv6 rules use brackets, for example `[::1]` or `[::1]:3000`. Literal and encoded
+dot segments such as `/work/../personal` and `/work/%2e%2e/personal` are resolved
+before path matching, as in HTTP browsers. Paths are case sensitive.
+Query strings and fragments are ignored when matching;
 rules themselves cannot contain either. A trailing slash does not change a path
 rule's meaning. Put narrow path rules above broad domain rules.
 
@@ -139,6 +145,9 @@ them. Reopen settings to handle them. There is no browsing history or telemetry.
 ## Update and uninstall
 
 For a cloned checkout, `git pull` and rerun `python3 install.py --enable-plugin`.
+When upgrading from 0.1.1 or earlier, install `python-idna` first if needed:
+`omarchy pkg add python-idna`. The installer checks this dependency before
+changing installed files.
 For a plugin-manager checkout, use `omarchy plugin update paweltkaczyk.browser-router`
 and rerun its installer if installed launcher paths have changed.
 
@@ -155,6 +164,7 @@ first if you prefer to remove the plugin through Omarchy's UI.
 ## Development
 
 ```sh
+python3 -m pip install -r requirements.txt  # In your development virtualenv
 python3 -m unittest discover -s tests -v
 python3 -m py_compile bin/omarchy-browser-router install.py
 omarchy plugin validate .
