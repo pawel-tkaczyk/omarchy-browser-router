@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""Local-only URL routing for Omarchy. Python standard library; never a shell."""
+from __future__ import annotations
+
+import argparse
+import configparser
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+import uuid
+
+PLUGIN = "paweltkaczyk.browser-router"
+DESKTOP = "omarchy-browser-router.desktop"
+HOME = Path.home()
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+CONFIG = CONFIG_HOME / "omarchy/browser-router.json"
+STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy/browser-router"
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share"))
+MAX_JSON = 2 * 1024 * 1024
+MAX_URL = 16384
+# Omarchy's native browser choices plus other common Chromium/Firefox relatives.
+# Desktop entries provide the actual executable (including Flatpak/Snap wrappers).
+SPECS = [
+    ("brave-browser", "Brave", "chromium", "BraveSoftware/Brave-Browser", ["brave", "brave-browser"]),
+    ("brave-origin", "Brave Origin", "chromium", "BraveSoftware/Brave-Origin", ["brave-origin"]),
+    ("google-chrome", "Chrome", "chromium", "google-chrome", ["google-chrome-stable", "google-chrome"]),
+    ("chromium", "Chromium", "chromium", "chromium", ["chromium"]),
+    ("microsoft-edge", "Edge", "chromium", "microsoft-edge", ["microsoft-edge-stable", "microsoft-edge"]),
+    ("vivaldi", "Vivaldi", "chromium", "vivaldi", ["vivaldi-stable", "vivaldi"]),
+    ("opera", "Opera", "chromium", "opera", ["opera"]),
+    ("firefox", "Firefox", "firefox", ".mozilla/firefox", ["firefox"]),
+    ("zen", "Zen", "firefox", ".zen", ["zen-browser", "zen"]),
+    ("librewolf", "LibreWolf", "firefox", ".librewolf", ["librewolf"]),
+    ("floorp", "Floorp", "firefox", ".floorp", ["floorp"]),
+    ("waterfox", "Waterfox", "firefox", ".waterfox", ["waterfox"]),
+    ("mullvad-browser", "Mullvad Browser", "firefox", ".mullvad/mullvadbrowser", ["mullvad-browser"]),
+]
+
+
+def run(argv, **kwargs):
+    return subprocess.run(argv, text=True, capture_output=True, timeout=10, **kwargs)
+
+
+def read_json(path, default=None):
+    try:
+        if path.stat().st_size > MAX_JSON:
+            raise ValueError(f"JSON file too large: {path.name}")
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".router-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+@contextlib.contextmanager
+def locked():
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (STATE / "config.lock").open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+def load_config():
+    config = read_json(CONFIG, {"version": 1, "fallback": "system", "rules": [], "paused": False})
+    if not isinstance(config, dict) or config.get("version") != 1 or not isinstance(config.get("rules"), list):
+        raise ValueError("Invalid browser-router.json configuration")
+    if len(config["rules"]) > 1000:
+        raise ValueError("At most 1000 rules are supported")
+    return config
+
+
+def data_dirs():
+    values = [DATA_HOME, *map(Path, os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"))]
+    # Include common sandbox exports even on sessions missing them in XDG_DATA_DIRS.
+    values += [HOME / ".local/share/flatpak/exports/share", Path("/var/lib/flatpak/exports/share"), Path("/var/lib/snapd/desktop")]
+    return list(dict.fromkeys(values))
+
+
+def desktop_entries():
+    entries = {}
+    for directory in data_dirs():
+        folder = directory / "applications"
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.rglob("*.desktop")):
+            desktop_id = str(path.relative_to(folder)).replace("/", "-")
+            if desktop_id in entries:
+                continue
+            parser = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                parser.read(path)
+                entry = dict(parser["Desktop Entry"])
+                entry["path"] = str(path)
+                entries[desktop_id] = entry
+            except (OSError, configparser.Error, KeyError):
+                continue
+    return entries
+
+
+def exec_argv(entry):
+    try:
+        words = shlex.split(entry.get("exec", ""))
+    except ValueError:
+        return []
+    argv = []
+    for word in words:
+        if word in ("%u", "%U", "%f", "%F", "%i", "%c", "%k", "@@u", "@@U", "@@", "--file-forwarding"):
+            continue
+        # Other freedesktop field codes must not become browser arguments.
+        if re.search(r"%[uUfFick]", word):
+            continue
+        argv.append(word.replace("%%", "%"))
+    if not argv or not shutil.which(argv[0]):
+        return []
+    return argv
+
+
+def profile_roots(family, relative, argv):
+    roots = [CONFIG_HOME / relative] if family == "chromium" else [HOME / relative, CONFIG_HOME / relative.lstrip(".")]
+    if family == "firefox":
+        roots += [CONFIG_HOME / relative / "", HOME / ".config" / relative.lstrip(".")]
+    if "flatpak" in Path(argv[0]).name:
+        app = next((a for a in argv if re.match(r"^(?:com|org|net|io)\.[\w.-]+$", a)), "")
+        if app:
+            base = HOME / ".var/app" / app
+            roots = ([base / "config" / relative] if family == "chromium" else [base / relative, base / "config" / relative.lstrip(".")])
+    if "/snap/" in " ".join(argv):
+        snap = Path(argv[0]).name
+        roots = [HOME / "snap" / snap / "common" / relative, HOME / "snap" / snap / "current/.config" / relative]
+    # Browser launchers may explicitly override their data directory.
+    for i, arg in enumerate(argv):
+        if arg.startswith("--user-data-dir="):
+            roots = [Path(arg.split("=", 1)[1]).expanduser()]
+        elif arg == "--user-data-dir" and i + 1 < len(argv):
+            roots = [Path(argv[i + 1]).expanduser()]
+    return list(dict.fromkeys(roots))
+
+
+def discover():
+    entries = desktop_entries()
+    targets = []
+    seen = set()
+    for key, name, family, relative, commands in SPECS:
+        candidates = []
+        for desktop_id, entry in entries.items():
+            if desktop_id in (DESKTOP, "omarchy-browser.desktop") or entry.get("hidden") == "true":
+                continue
+            argv = exec_argv(entry)
+            if not argv:
+                continue
+            # Recognise desktop IDs, native commands and Flatpak application IDs.
+            words = [Path(w).name.lower() for w in argv]
+            matches = any(w in commands for w in words)
+            flatpak_match = "flatpak" in words and key.replace("-browser", "").replace("-", "") in "".join(words).replace(".", "").replace("-", "")
+            if not (matches or flatpak_match):
+                continue
+            # Keep distinct packaged channels, omit profile-specific shortcuts.
+            if any(a.startswith(("--profile-directory", "--app=", "-P")) for a in argv):
+                continue
+            candidates.append((desktop_id, entry.get("name", name), argv))
+        if not candidates:
+            command = next((c for c in commands if shutil.which(c)), None)
+            if command:
+                candidates.append((key + ".desktop", name, [command]))
+        for desktop_id, label, argv in candidates:
+            # The Brave Origin binary is a different browser despite its common name.
+            if (desktop_id, tuple(argv)) in seen:
+                continue
+            seen.add((desktop_id, tuple(argv)))
+            base = {"desktop": desktop_id, "browser": label, "family": family, "argv": argv}
+            profiles = []
+            for root in profile_roots(family, relative, argv):
+                if family == "chromium":
+                    try:
+                        state = read_json(root / "Local State", {})
+                        cache = state.get("profile", {}).get("info_cache", {})
+                        for directory, info in sorted(cache.items()):
+                            if not re.fullmatch(r"Default|Profile \d+", directory) or not (root / directory).is_dir():
+                                continue
+                            profiles.append((directory, str(info.get("name", directory))[:256], str(root)))
+                        if not cache and (root / "Default").is_dir():
+                            profiles.append(("Default", "Default", str(root)))
+                    except (ValueError, AttributeError, OSError):
+                        continue
+                else:
+                    parser = configparser.ConfigParser(interpolation=None, strict=False)
+                    try:
+                        parser.read(root / "profiles.ini")
+                        for section in parser.sections():
+                            if not section.startswith("Profile") or not parser.has_option(section, "Path"):
+                                continue
+                            value = parser[section]
+                            path = Path(value["Path"])
+                            if value.get("IsRelative", "1") == "1":
+                                path = root / path
+                            if path.is_dir():
+                                profiles.append((str(path.resolve()), value.get("Name", section)[:256], str(root)))
+                    except (OSError, configparser.Error):
+                        continue
+            # Always expose the browser's own default as well as named profiles.
+            targets.append({**base, "id": desktop_id, "label": label, "profile": "", "root": ""})
+            for profile, profile_name, root in dict.fromkeys(profiles):
+                digest = hashlib.sha256((root + "\0" + profile).encode()).hexdigest()[:16]
+                targets.append({**base, "id": desktop_id + "::" + digest, "label": label + " · " + profile_name, "profile": profile, "root": root})
+    # Unknown installed web browsers still work without profile discovery.
+    for desktop_id, entry in entries.items():
+        if desktop_id in (DESKTOP, "omarchy-browser.desktop") or any(t["desktop"] == desktop_id for t in targets):
+            continue
+        if "x-scheme-handler/https" not in entry.get("mimetype", "") or entry.get("hidden") == "true":
+            continue
+        argv = exec_argv(entry)
+        if argv:
+            label = entry.get("name", desktop_id)[:256]
+            targets.append({"id": desktop_id, "desktop": desktop_id, "browser": label, "label": label, "family": "generic", "argv": argv, "profile": "", "root": ""})
+    return targets
+
+
+def validate_url(url):
+    if not isinstance(url, str) or not url or len(url) > MAX_URL or any(ord(c) < 32 or ord(c) == 127 for c in url):
+        raise ValueError("Invalid URL")
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        raise ValueError("Use an http:// or https:// URL without embedded credentials")
+    try:
+        parsed.port
+    except ValueError as error:
+        raise ValueError("Invalid URL port") from error
+    return parsed
+
+
+def hostname(value):
+    return value.rstrip(".").encode("idna").decode("ascii").lower()
+
+
+def pattern_parts(pattern):
+    if not isinstance(pattern, str) or not pattern.strip() or len(pattern) > 4096:
+        raise ValueError("Enter a domain or URL prefix")
+    pattern = pattern.strip()
+    wildcard = pattern.startswith("*.")
+    if wildcard:
+        pattern = pattern[2:]
+    parsed = validate_url(pattern if "://" in pattern else "https://" + pattern)
+    if parsed.query or parsed.fragment or "*" in parsed.netloc or "*" in parsed.path:
+        raise ValueError("Rules support domains, *.subdomains, and path prefixes; omit query strings and fragments")
+    host = hostname(parsed.hostname)
+    if not re.fullmatch(r"[a-z0-9_.:-]+", host):
+        raise ValueError("Invalid rule hostname")
+    return parsed, host, wildcard
+
+
+def matches(pattern, url):
+    rule, host, wildcard = pattern_parts(pattern)
+    candidate = validate_url(url)
+    actual = hostname(candidate.hostname)
+    host_match = (actual.endswith("." + host) and actual != host) if wildcard else actual == host
+    if not host_match or (rule.port is not None and rule.port != candidate.port):
+        return False
+    if "://" in pattern and rule.scheme.lower() != candidate.scheme.lower():
+        return False
+    prefix = rule.path.rstrip("/")
+    return not prefix or candidate.path == prefix or candidate.path.startswith(prefix + "/")
+
+
+def resolve(config, url):
+    validate_url(url)
+    if not config.get("paused", False):
+        for rule in config["rules"]:
+            if rule.get("enabled", True) and matches(rule["pattern"], url):
+                return rule["target"], rule["pattern"]
+    return config.get("fallback", "system"), ""
+
+
+def system_browser():
+    if shutil.which("omarchy-cmd-default-browser"):
+        result = run(["omarchy-cmd-default-browser"])
+        if result.returncode == 0:
+            return result.stdout.strip()
+    env = {**os.environ, "XDG_CURRENT_DESKTOP": ""}
+    env.pop("BROWSER", None)
+    return run(["xdg-mime", "query", "default", "x-scheme-handler/http"], env=env).stdout.strip()
+
+
+def system_target(config, targets):
+    desktop = system_browser()
+    if desktop in (DESKTOP, "omarchy-browser.desktop", ""):
+        desktop = config.get("previous_browser", "")
+    target = next((t for t in targets if t["id"] == desktop), None)
+    if not target:
+        raise ValueError("The Omarchy default browser is unavailable. Select a fallback browser/profile in Browser Router.")
+    return target
+
+
+def launch(target, urls, private=False):
+    for url in urls:
+        validate_url(url)
+    argv = list(target["argv"])
+    if target["profile"]:
+        if target["family"] == "chromium":
+            # Explicit root also handles sandboxed profiles and nonstandard XDG roots.
+            if not any(a.startswith("--user-data-dir") for a in argv):
+                argv.append("--user-data-dir=" + target["root"])
+            argv.append("--profile-directory=" + target["profile"])
+        else:
+            argv += ["-profile", target["profile"]]
+    if private:
+        if target["family"] == "generic":
+            raise ValueError("Private mode is not supported for this browser")
+        argv += ["-private-window" if target["family"] == "firefox" else "--inprivate" if "edge" in target["desktop"] else "--incognito"]
+    # No shell, eval, xdg-open, or recursive call through the default browser.
+    subprocess.Popen(argv + urls, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return argv + urls
+
+
+def notify(message):
+    if shutil.which("notify-send"):
+        run(["notify-send", "Browser Router", message])
+
+
+def summon():
+    result = run(["omarchy-shell", "shell", "summon", PLUGIN, "{}"])
+    if result.returncode or result.stdout.strip() != "ok":
+        raise ValueError("The Omarchy shell/plugin is unavailable. Enable Browser Router in Omarchy's plugin settings, then reopen settings. Queued links are retained.")
+
+
+def pending():
+    folder = STATE / "pending"
+    if not folder.exists():
+        return []
+    # Links expire after a day; they are not a browsing history.
+    result = []
+    for path in sorted(folder.glob("*.json"), key=lambda p: p.name):
+        if time.time() - path.stat().st_mtime > 86400:
+            path.unlink(missing_ok=True)
+            continue
+        value = read_json(path)
+        if isinstance(value, dict):
+            result.append(value)
+    return result
+
+
+def request_path(request_id):
+    if not re.fullmatch(r"[0-9]{20}-[a-f0-9]{32}", request_id):
+        raise ValueError("Invalid request ID")
+    return STATE / "pending" / (request_id + ".json")
+
+
+def enqueue(url, private=False):
+    request_id = f"{time.time_ns():020d}-{uuid.uuid4().hex}"
+    write_json(request_path(request_id), {"id": request_id, "url": url, "private": private})
+
+
+def route(urls, private=False, dry_run=False):
+    config = load_config()
+    targets = discover()
+    decisions = []
+    asked = False
+    for url in urls or [""]:
+        target_id, pattern = resolve(config, url) if url else (config.get("fallback", "system"), "")
+        target = None
+        if target_id != "ask":
+            target = system_target(config, targets) if target_id == "system" else next((t for t in targets if t["id"] == target_id), None)
+            # A removed browser/profile should prompt, never silently use another identity.
+        decisions.append({"url": url, "rule": pattern, "target": target["id"] if target else "ask", "label": target["label"] if target else "Ask each time"})
+        if dry_run:
+            continue
+        if target:
+            launch(target, [url] if url else [], private)
+        elif url:
+            enqueue(url, private)
+            asked = True
+        else:
+            summon()
+    if asked:
+        summon()
+    return decisions
+
+
+def set_handler(desktop, mime):
+    env = {**os.environ, "XDG_CURRENT_DESKTOP": ""}
+    env.pop("BROWSER", None)
+    result = run(["xdg-mime", "default", desktop, mime], env=env)
+    if result.returncode:
+        raise ValueError("Could not update the default browser: " + result.stderr.strip())
+
+
+def activate(config):
+    current = system_browser()
+    if current != DESKTOP:
+        if current and current != "omarchy-browser.desktop":
+            config["previous_browser"] = current
+        if not config.get("previous_browser"):
+            raise ValueError("Set a browser in Omarchy before enabling routing")
+        env = {**os.environ, "XDG_CURRENT_DESKTOP": ""}
+        config["previous_handlers"] = {mime: run(["xdg-mime", "query", "default", mime], env=env).stdout.strip() for mime in ("x-scheme-handler/http", "x-scheme-handler/https")}
+        # Save recovery information before changing either MIME handler.
+        write_json(CONFIG, config)
+    changed = []
+    try:
+        for mime in ("x-scheme-handler/http", "x-scheme-handler/https"):
+            set_handler(DESKTOP, mime)
+            changed.append(mime)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        for mime in changed:
+            previous = config.get("previous_handlers", {}).get(mime) or config["previous_browser"]
+            set_handler(previous, mime)
+        raise
+
+
+def deactivate(config):
+    previous = config.get("previous_browser", "")
+    env = {**os.environ, "XDG_CURRENT_DESKTOP": ""}
+    env.pop("BROWSER", None)
+    for mime in ("x-scheme-handler/http", "x-scheme-handler/https"):
+        current = run(["xdg-mime", "query", "default", mime], env=env).stdout.strip()
+        # A browser selected after installation belongs to the user; leave it alone.
+        if current != DESKTOP:
+            continue
+        if not previous or previous in (DESKTOP, "omarchy-browser.desktop"):
+            raise ValueError("No previous browser recorded; choose one in Omarchy")
+        desktop = config.get("previous_handlers", {}).get(mime, previous)
+        if desktop in ("", DESKTOP, "omarchy-browser.desktop"):
+            desktop = previous
+        set_handler(desktop, mime)
+
+
+def snapshot(message=""):
+    config = load_config()
+    targets = discover()
+    current = system_browser()
+    return {"config": config, "targets": targets, "pending": pending(), "active": current == DESKTOP, "systemBrowser": config.get("previous_browser", "") if current == DESKTOP else current, "message": message}
+
+
+def action(name, payload):
+    with locked():
+        config = load_config()
+        targets = discover()
+        allowed = {t["id"] for t in targets} | {"ask", "system"}
+        if name == "rule":
+            pattern = payload["pattern"].strip()
+            pattern_parts(pattern)
+            target = payload["target"]
+            if target not in allowed:
+                raise ValueError("Select an available browser/profile or Ask")
+            rule = {"id": payload.get("id") or uuid.uuid4().hex, "pattern": pattern, "target": target, "enabled": True}
+            config["rules"] = [r for r in config["rules"] if r["id"] != rule["id"]]
+            index = max(0, min(int(payload.get("index", len(config["rules"]))), len(config["rules"])))
+            config["rules"].insert(index, rule)
+        elif name == "delete":
+            config["rules"] = [r for r in config["rules"] if r["id"] != payload["id"]]
+        elif name == "move":
+            index = next(i for i, r in enumerate(config["rules"]) if r["id"] == payload["id"])
+            new_index = max(0, min(len(config["rules"]) - 1, index + int(payload["delta"])))
+            config["rules"].insert(new_index, config["rules"].pop(index))
+        elif name == "fallback":
+            if payload["target"] not in allowed - {"ask"}:
+                raise ValueError("Select an available fallback browser/profile")
+            config["fallback"] = payload["target"]
+        elif name == "pause":
+            config["paused"] = bool(payload["paused"])
+        elif name == "activate":
+            activate(config)
+        elif name == "deactivate":
+            deactivate(config)
+        elif name in ("choose", "cancel"):
+            path = request_path(payload["id"])
+            request = read_json(path)
+            if not request:
+                raise ValueError("This link has already been handled")
+            if name == "choose":
+                target = next((t for t in targets if t["id"] == payload["target"]), None)
+                if not target:
+                    raise ValueError("That browser/profile is no longer available")
+                if payload.get("remember"):
+                    pattern = hostname(validate_url(request["url"]).hostname)
+                    # User's explicit Always action wins over existing broad rules.
+                    config["rules"].insert(0, {"id": uuid.uuid4().hex, "pattern": pattern, "target": target["id"], "enabled": True})
+                launch(target, [request["url"]], request.get("private", False))
+            path.unlink(missing_ok=True)
+        else:
+            raise ValueError("Unknown action")
+        if len(config["rules"]) > 1000:
+            raise ValueError("At most 1000 rules are supported")
+        write_json(CONFIG, config)
+    return snapshot()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--private", "--incognito", action="store_true", dest="private")
+    parser.add_argument("command", nargs="?", default="open")
+    parser.add_argument("arguments", nargs="*")
+    args = parser.parse_args()
+    if args.command == "snapshot":
+        print(json.dumps(snapshot()))
+    elif args.command == "action":
+        if len(args.arguments) != 2:
+            raise ValueError("action requires a name and JSON object")
+        print(json.dumps(action(args.arguments[0], json.loads(args.arguments[1]))))
+    elif args.command == "settings":
+        summon()
+    elif args.command == "test":
+        print(json.dumps(route(args.arguments, dry_run=True)))
+    elif args.command == "open":
+        route(args.arguments, args.private)
+    elif args.command.startswith(("https://", "http://")):
+        route([args.command] + args.arguments, args.private)
+    else:
+        parser.error("Expected a URL, open, settings, snapshot, action, or test")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, KeyError, OSError, StopIteration, subprocess.SubprocessError) as error:
+        message = str(error) or "The requested rule or browser is unavailable"
+        if len(sys.argv) > 1 and sys.argv[1] in ("action", "snapshot", "test"):
+            print(json.dumps({"error": message}))
+        else:
+            print("Browser Router: " + message, file=sys.stderr)
+            notify(message)
+        sys.exit(1)

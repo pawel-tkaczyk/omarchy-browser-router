@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "paweltkaczyk.browser-router",
+  "name": "Browser Router",
+  "version": "0.1.0",
+  "author": "Pawel Tkaczyk",
+  "license": "MIT",
+  "description": "Open links in the right browser profile, or ask each time.",
+  "kinds": ["panel", "bar-widget"],
+  "entryPoints": {"panel": "Settings.qml", "barWidget": "BarWidget.qml"},
+  "barWidget": {
+    "displayName": "Browser Router",
+    "description": "Manage URL rules and browser profiles",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
