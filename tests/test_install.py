@@ -22,7 +22,7 @@ class Installer(unittest.TestCase):
             path = config_home / "omarchy/shell.json"
             path.parent.mkdir(parents=True)
             path.write_text(json.dumps({"idle": {"lock": 99}, "plugins": [{"id": "other.plugin"}]}))
-            with patch.multiple(installer, HOME=root, CONFIG_HOME=config_home, DATA_HOME=data_home, DEST=destination, BINDIR=bindir), patch.object(installer.subprocess, "run") as run:
+            with patch.multiple(installer, HOME=root, CONFIG_HOME=config_home, DATA_HOME=data_home, DEST=destination, BINDIR=bindir), patch.object(installer.subprocess, "run") as run, patch.object(installer.shutil, "which", return_value="/mock/omarchy"):
                 with patch("sys.argv", ["install.py", "--enable-plugin"]):
                     installer.main()
                 config = json.loads(path.read_text())
