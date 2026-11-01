@@ -4,7 +4,7 @@ Open work links in your work profile, personal links in your personal profile,
 and shared sites in a browser picker. A native Omarchy shell plugin with a small,
 local URL handler. No Python packages, background daemon, or network service.
 
-**Status: initial release (0.1.0).** Requires Omarchy's Quickshell plugin system
+**Status: initial release (0.1.1).** Requires Omarchy's Quickshell plugin system
 (`omarchy plugin validate` must be available), Python 3.10+, and xdg-utils.
 
 ## Features
@@ -57,7 +57,11 @@ omarchy-browser-router settings
 ```
 
 If your `PATH` does not include `~/.local/bin`, use that directory's absolute
-path for the command. The installed desktop entries use absolute paths.
+path for the command. The installed desktop entries use absolute paths for
+ordinary home directories. If your home path requires quoting (for example,
+contains spaces), the browser handler uses the bare command and `~/.local/bin`
+must be on the session's `PATH`, since Omarchy's browser resolver does not parse
+quoted executables in desktop entries.
 
 ## Rules
 

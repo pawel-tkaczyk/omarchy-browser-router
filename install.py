@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,14 @@ CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
 DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share"))
 DEST = CONFIG_HOME / "omarchy/plugins" / PLUGIN
 BINDIR = HOME / ".local/bin"
+
+
+def browser_exec(command):
+    # Omarchy extracts Exec's first space-delimited token literally, without
+    # desktop-entry quote parsing. Quotes make an installed handler look absent.
+    # Use a bare PATH command for unusual home paths that require quoting.
+    value = str(command)
+    return value if re.fullmatch(r"[A-Za-z0-9/._-]+", value) else command.name
 
 
 def main():
@@ -58,7 +67,7 @@ def main():
     path = str(command).replace("\\", "\\\\\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$").replace("%", "%%")
     (applications / "omarchy-browser-router.desktop").write_text(
         '[Desktop Entry]\nType=Application\nName=Browser Router\nComment=Route links to browser profiles\n'
-        f'Exec="{path}" open %U\nIcon=web-browser\nTerminal=false\nNoDisplay=true\n'
+        f'Exec={browser_exec(command)} open %U\nIcon=web-browser\nTerminal=false\nNoDisplay=true\n'
         'Categories=Network;WebBrowser;\nMimeType=x-scheme-handler/http;x-scheme-handler/https;\n')
     (applications / "omarchy-browser-router-settings.desktop").write_text(
         '[Desktop Entry]\nType=Application\nName=Browser Router Settings\n'
